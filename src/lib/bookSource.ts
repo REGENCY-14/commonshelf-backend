@@ -1,42 +1,36 @@
 import type { Book, BookDetail, BookFormat } from "../types.js";
 
-const GUTENDEX_BASE_URL = process.env.GUTENDEX_BASE_URL ?? "https://gutendex.com";
-const SOURCE_CATALOG = "Project Gutenberg";
+const OPENLIBRARY_BASE_URL = process.env.OPENLIBRARY_BASE_URL ?? "https://openlibrary.org";
+const ARCHIVE_BASE_URL = process.env.ARCHIVE_BASE_URL ?? "https://archive.org";
+const SOURCE_CATALOG = "Internet Archive";
+const SEARCH_FIELDS = "key,title,author_name,first_publish_year,language,subject,cover_i,ia";
 
-interface GutendexAuthor {
-  name: string;
-  birth_year: number | null;
-  death_year: number | null;
-}
-
-interface GutendexBook {
-  id: number;
+interface OpenLibrarySearchDoc {
+  key: string; // e.g. "/works/OL85892W"
   title: string;
-  authors: GutendexAuthor[];
-  subjects: string[];
-  bookshelves: string[];
-  languages: string[];
-  copyright: boolean | null;
-  media_type: string;
-  formats: Record<string, string>;
-  download_count: number;
-  summaries?: string[];
+  author_name?: string[];
+  first_publish_year?: number;
+  language?: string[];
+  subject?: string[];
+  cover_i?: number;
+  ia?: string[];
 }
 
-interface GutendexListResponse {
-  count: number;
-  next: string | null;
-  previous: string | null;
-  results: GutendexBook[];
+interface OpenLibrarySearchResponse {
+  docs: OpenLibrarySearchDoc[];
 }
 
-const FORMAT_TYPE_BY_MIME: Record<string, BookFormat["type"]> = {
-  "application/epub+zip": "epub",
-  "application/pdf": "pdf",
-  "text/plain": "txt",
-  "text/plain; charset=utf-8": "txt",
-  "text/plain; charset=us-ascii": "txt",
-};
+interface OpenLibraryWork {
+  description?: string | { value: string };
+}
+
+interface ArchiveFile {
+  name: string;
+}
+
+interface ArchiveMetadata {
+  files?: ArchiveFile[];
+}
 
 export class BookSourceError extends Error {
   constructor(message: string, public readonly cause?: unknown) {
@@ -45,109 +39,140 @@ export class BookSourceError extends Error {
   }
 }
 
-function extractFormats(formats: Record<string, string>): BookFormat[] {
-  const seen = new Set<BookFormat["type"]>();
-  const result: BookFormat[] = [];
-  for (const [mime, url] of Object.entries(formats)) {
-    const type = FORMAT_TYPE_BY_MIME[mime];
-    if (!type || seen.has(type)) continue;
-    seen.add(type);
-    result.push({ type, url });
-  }
-  return result;
-}
-
-function extractCoverUrl(formats: Record<string, string>): string | null {
-  const jpeg = Object.entries(formats).find(([mime]) => mime.startsWith("image/"));
-  return jpeg ? jpeg[1] : null;
-}
-
-function toBook(raw: GutendexBook): Book {
-  return {
-    id: String(raw.id),
-    title: raw.title,
-    author: raw.authors.map((a) => a.name).join(", ") || "Unknown",
-    // Gutendex has no original-publication-year field; author birth/death
-    // years describe the person, not the work, so we don't fabricate one.
-    year: null,
-    language: raw.languages[0] ?? "en",
-    subjects: raw.subjects,
-    sourceCatalog: SOURCE_CATALOG,
-    coverUrl: extractCoverUrl(raw.formats),
-    formats: extractFormats(raw.formats),
-    description: raw.summaries && raw.summaries.length > 0 ? raw.summaries[0] : null,
-  };
-}
-
 const UPSTREAM_TIMEOUT_MS = 10_000;
 
-async function fetchJson<T>(url: string): Promise<T> {
+async function fetchJson<T>(url: string, serviceName: string): Promise<T> {
   let response: Response;
   try {
     response = await fetch(url, {
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
       headers: {
-        // Cloudflare (fronting gutendex.com) 403s requests with no/generic
-        // User-Agent from datacenter IPs (e.g. Render's shared egress).
         "User-Agent": "Mozilla/5.0 (compatible; CommonShelfBot/1.0; +https://github.com/REGENCY-14/commonshelf-backend)",
         Accept: "application/json",
       },
     });
   } catch (err) {
-    console.error("Gutendex fetch failed:", url, err);
-    throw new BookSourceError("Failed to reach Project Gutenberg (Gutendex) API", err);
+    console.error(`${serviceName} fetch failed:`, url, err);
+    throw new BookSourceError(`Failed to reach ${serviceName}`, err);
   }
   if (!response.ok) {
     const body = await response.text().catch(() => "<unreadable body>");
     console.error(
-      "Gutendex returned non-OK status:",
+      `${serviceName} returned non-OK status:`,
       url,
       response.status,
       "server:",
       response.headers.get("server"),
-      "cf-ray:",
-      response.headers.get("cf-ray"),
       "body:",
       body.slice(0, 500)
     );
-    throw new BookSourceError(`Gutendex API returned status ${response.status}`);
+    throw new BookSourceError(`${serviceName} returned status ${response.status}`);
   }
   try {
     return (await response.json()) as T;
   } catch (err) {
-    throw new BookSourceError("Gutendex API returned an unparseable response", err);
+    throw new BookSourceError(`${serviceName} returned an unparseable response`, err);
   }
+}
+
+function workIdFromKey(key: string): string {
+  return key.replace(/^\/works\//, "");
+}
+
+function coverUrlFromId(coverId: number | undefined): string | null {
+  return coverId ? `https://covers.openlibrary.org/b/id/${coverId}-L.jpg` : null;
+}
+
+/**
+ * Maps a work's Internet Archive files into our normalized format list,
+ * matching real, verified filenames rather than guessing a naming
+ * convention — IA scans don't follow one consistent pattern.
+ */
+function extractArchiveFormats(iaId: string, files: ArchiveFile[]): BookFormat[] {
+  const found: Partial<Record<BookFormat["type"], string>> = {};
+  for (const file of files) {
+    const name = file.name ?? "";
+    if (!found.epub && /\.epub$/i.test(name)) found.epub = name;
+    else if (!found.pdf && /\.pdf$/i.test(name) && !/_bw\.pdf$/i.test(name)) found.pdf = name;
+    else if (!found.txt && /_djvu\.txt$/i.test(name)) found.txt = name;
+  }
+  const order: BookFormat["type"][] = ["epub", "pdf", "txt"];
+  return order
+    .filter((type) => found[type])
+    .map((type) => ({ type, url: `${ARCHIVE_BASE_URL}/download/${iaId}/${found[type]}` }));
+}
+
+function toBook(doc: OpenLibrarySearchDoc, formats: BookFormat[] = []): Book {
+  return {
+    id: workIdFromKey(doc.key),
+    title: doc.title,
+    author: doc.author_name?.join(", ") ?? "Unknown",
+    year: doc.first_publish_year ? String(doc.first_publish_year) : null,
+    language: doc.language?.[0] ?? "en",
+    subjects: doc.subject?.slice(0, 8) ?? [],
+    sourceCatalog: SOURCE_CATALOG,
+    coverUrl: coverUrlFromId(doc.cover_i),
+    formats,
+    description: null,
+  };
+}
+
+async function searchDocs(query: string): Promise<OpenLibrarySearchDoc[]> {
+  const url = `${OPENLIBRARY_BASE_URL}/search.json?q=${encodeURIComponent(query)}&fields=${SEARCH_FIELDS}&limit=20`;
+  const data = await fetchJson<OpenLibrarySearchResponse>(url, "Open Library");
+  // Only keep works with a real Internet Archive copy — this is a catalog
+  // of readable books, not just bibliographic records.
+  return data.docs.filter((doc) => doc.ia && doc.ia.length > 0);
 }
 
 export async function searchBooks(query: string): Promise<Book[]> {
-  const url = `${GUTENDEX_BASE_URL}/books?search=${encodeURIComponent(query)}`;
-  const data = await fetchJson<GutendexListResponse>(url);
-  return data.results.map(toBook);
+  const docs = await searchDocs(query);
+  return docs.map((doc) => toBook(doc));
+}
+
+async function fetchDescription(workId: string): Promise<string | null> {
+  try {
+    const work = await fetchJson<OpenLibraryWork>(`${OPENLIBRARY_BASE_URL}/works/${workId}.json`, "Open Library");
+    if (typeof work.description === "string") return work.description;
+    return work.description?.value ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export async function getBookById(id: string): Promise<BookDetail | null> {
-  const url = `${GUTENDEX_BASE_URL}/books/${encodeURIComponent(id)}`;
-  let raw: GutendexBook;
-  try {
-    raw = await fetchJson<GutendexBook>(url);
-  } catch (err) {
-    if (err instanceof BookSourceError && err.message.includes("status 404")) {
-      return null;
-    }
-    throw err;
-  }
+  const url = `${OPENLIBRARY_BASE_URL}/search.json?q=${encodeURIComponent(`key:/works/${id}`)}&fields=${SEARCH_FIELDS}&limit=1`;
+  const data = await fetchJson<OpenLibrarySearchResponse>(url, "Open Library");
+  const doc = data.docs[0];
+  if (!doc) return null;
 
-  const book = toBook(raw);
-  const primaryAuthor = raw.authors[0]?.name;
-  let relatedBooks: Book[] = [];
-  if (primaryAuthor) {
+  const iaId = doc.ia?.[0];
+  let formats: BookFormat[] = [];
+  if (iaId) {
     try {
-      const related = await searchBooks(primaryAuthor);
-      relatedBooks = related.filter((b) => b.id !== book.id).slice(0, 5);
+      const meta = await fetchJson<ArchiveMetadata>(
+        `${ARCHIVE_BASE_URL}/metadata/${encodeURIComponent(iaId)}`,
+        "Internet Archive"
+      );
+      formats = extractArchiveFormats(iaId, meta.files ?? []);
     } catch {
-      relatedBooks = [];
+      formats = [];
     }
   }
 
-  return { ...book, relatedBooks };
+  const [description, relatedBooks] = await Promise.all([
+    fetchDescription(id),
+    (async () => {
+      const primaryAuthor = doc.author_name?.[0];
+      if (!primaryAuthor) return [];
+      try {
+        const related = await searchBooks(primaryAuthor);
+        return related.filter((b) => b.id !== id).slice(0, 5);
+      } catch {
+        return [];
+      }
+    })(),
+  ]);
+
+  return { ...toBook(doc, formats), description, relatedBooks };
 }

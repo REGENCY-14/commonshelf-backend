@@ -24,8 +24,13 @@ app.listen(PORT, () => {
 
 if (TELEGRAM_BOT_TOKEN) {
   const bot = createBot(TELEGRAM_BOT_TOKEN);
-  bot.launch();
-  console.log("Telegram bot started (long polling)");
+  // launch() rejects on polling errors (e.g. 409 Conflict from a second
+  // instance); an unhandled rejection would otherwise crash the whole
+  // process, taking the HTTP API down with it.
+  bot
+    .launch()
+    .then(() => console.log("Telegram bot started (long polling)"))
+    .catch((err) => console.error("Telegram bot failed to start — HTTP API still running:", err));
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
