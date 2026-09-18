@@ -84,7 +84,15 @@ const UPSTREAM_TIMEOUT_MS = 10_000;
 async function fetchJson<T>(url: string): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(url, { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+    response = await fetch(url, {
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      headers: {
+        // Cloudflare (fronting gutendex.com) 403s requests with no/generic
+        // User-Agent from datacenter IPs (e.g. Render's shared egress).
+        "User-Agent": "Mozilla/5.0 (compatible; CommonShelfBot/1.0; +https://github.com/REGENCY-14/commonshelf-backend)",
+        Accept: "application/json",
+      },
+    });
   } catch (err) {
     console.error("Gutendex fetch failed:", url, err);
     throw new BookSourceError("Failed to reach Project Gutenberg (Gutendex) API", err);
