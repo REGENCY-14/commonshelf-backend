@@ -86,9 +86,11 @@ async function fetchJson<T>(url: string): Promise<T> {
   try {
     response = await fetch(url, { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
   } catch (err) {
+    console.error("Gutendex fetch failed:", url, err);
     throw new BookSourceError("Failed to reach Project Gutenberg (Gutendex) API", err);
   }
   if (!response.ok) {
+    console.error("Gutendex returned non-OK status:", url, response.status);
     throw new BookSourceError(`Gutendex API returned status ${response.status}`);
   }
   try {
