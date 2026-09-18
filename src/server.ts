@@ -9,6 +9,9 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ALLOWED_ORIGIN = process.env.FRONTEND_ORIGIN ?? "http://localhost:3000";
 
 const app = express();
+// Render (and most PaaS hosts) sit behind a reverse proxy that sets
+// X-Forwarded-For; without this, express-rate-limit throws on every request.
+app.set("trust proxy", 1);
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json());
 
